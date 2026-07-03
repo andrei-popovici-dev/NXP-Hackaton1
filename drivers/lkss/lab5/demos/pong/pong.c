@@ -61,8 +61,11 @@ static void game_tick(lv_timer_t *t)
 
     uint32_t btns = hal_buttons();
 
-    if (hal_button_pressed(HACKPAD_BTN_SW3) && !running)
+    if (hal_button_pressed(HACKPAD_BTN_SW2) && !running)
         new_game();
+
+    if (hal_button_pressed(HACKPAD_BTN_SW4))
+	exit(0);
 
     if (!running)
         return;
@@ -72,10 +75,10 @@ static void game_tick(lv_timer_t *t)
      * held, increase it. Clamp so the paddle stays on screen.
      */
     if (btns & (1 << HACKPAD_BTN_SW1)) {
-        lpad_y -= PADDLE_SPD;
+        lpad_y += PADDLE_SPD; // goes down
     }
-    if (btns & (1 << HACKPAD_BTN_SW2)) {
-        lpad_y += PADDLE_SPD;
+    if (btns & (1 << HACKPAD_BTN_SW3)) {
+        lpad_y -= PADDLE_SPD; // goes up
     }
     lpad_y = LV_CLAMP(PADDLE_H / 2, lpad_y, SCREEN - PADDLE_H / 2);
 

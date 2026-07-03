@@ -20,6 +20,7 @@
  */
 #include "hal.h"
 
+#include <stdio.h>
 #include <time.h>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -176,6 +177,13 @@ int main(void)
 {
 	hal_init();
 
+	double temp_c;
+	double press_hpa;
+	int rc = hal_bmp280_read(&temp_c, &press_hpa);
+
+	if (rc)
+		printf("ERROR: Could not read temperature!\n");
+
 	lv_obj_t *scr = lv_screen_active();
 	lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
 	lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
@@ -223,7 +231,13 @@ int main(void)
 	/* top-left temperature - placeholder until you fetch a real reading:
 	 *   lv_label_set_text_fmt(temp_label, "%d\u00B0C", celsius); */
 	temp_label = lv_label_create(scr);
-	lv_label_set_text(temp_label, "--\u00B0C");
+	
+	if (rc == 0) {
+		lv_label_set_text_fmt(temp_label, "%f\u00B0C", temp_c);
+	} else {
+		lv_label_set_text(temp_label, "--\u00B0C");
+	}
+
 	lv_obj_set_style_text_color(temp_label, lv_color_white(), 0);
 	lv_obj_set_style_text_font(temp_label, &lv_font_montserrat_12, 0);
 	lv_obj_align(temp_label, LV_ALIGN_TOP_LEFT, 4, 4);

@@ -320,10 +320,9 @@ static void button_timer_cb(lv_timer_t *timer)
         if (hal_button_pressed(HACKPAD_BTN_SW1) || hal_button_pressed(HACKPAD_BTN_SW2) ||
             hal_button_pressed(HACKPAD_BTN_SW3) || hal_button_pressed(HACKPAD_BTN_SW4)) {
             
-			if ((hal_buttons() & (1 << HACKPAD_BTN_SW1)) && 
-        		(hal_buttons() & (1 << HACKPAD_BTN_SW2))) {
-        			exit(0);
-    		}
+	    if (hal_buttons() == ((1 << HACKPAD_BTN_SW4) || (1 << HACKPAD_BTN_SW2))) {
+        	exit(0);
+    	    }
             /* Clear the board and reset state */
             memset(board, 0, sizeof(board));
             score = 0;
