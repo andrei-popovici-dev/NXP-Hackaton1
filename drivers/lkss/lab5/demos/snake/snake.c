@@ -28,7 +28,7 @@ static struct cell food;
 static bool running;
 static int score;
 
-static lv_obj_t *seg_obj[MAX_LEN];  /* Obiectele vor fi inițializate cu NULL automat la nivel global */
+static lv_obj_t *seg_obj[MAX_LEN];  
 static lv_obj_t *food_obj;
 static lv_obj_t *score_lbl, *msg_lbl;
 static lv_timer_t *tick_timer;
@@ -70,7 +70,6 @@ static void redraw(void)
     lv_obj_t *scr = lv_screen_active();
 
     for (int i = 0; i < length; i++) {
-        // LAZY ALLOCATION: Creăm obiectul doar dacă nu există deja
         if (seg_obj[i] == NULL) {
             seg_obj[i] = lv_obj_create(scr);
             if (seg_obj[i] != NULL) {
@@ -80,7 +79,6 @@ static void redraw(void)
             }
         }
 
-        // Randăm obiectul creat
         if (seg_obj[i] != NULL) {
             lv_obj_remove_flag(seg_obj[i], LV_OBJ_FLAG_HIDDEN);
             lv_obj_set_pos(seg_obj[i], body[i].x * CELL + 1, body[i].y * CELL + 1);
@@ -91,7 +89,6 @@ static void redraw(void)
         }
     }
 
-    // Ascundem părțile inactive (în cazul unui restart)
     for (int i = length; i < MAX_LEN; i++) {
         if (seg_obj[i] != NULL) {
             lv_obj_add_flag(seg_obj[i], LV_OBJ_FLAG_HIDDEN);
@@ -125,7 +122,6 @@ void game_over(void)
 {
     running = false;
     if (msg_lbl) {
-        /* Am adăugat linia pentru opțiunea de ieșire din joc */
         lv_label_set_text_fmt(msg_lbl, "GAME OVER\nscore %d\nSW3 = restart\nSW2 = exit", score);
     }
 }
@@ -133,11 +129,6 @@ void game_over(void)
 static void game_tick(lv_timer_t *t)
 {
     LV_UNUSED(t);
-
-    if (hal_button_pressed(HACKPAD_BTN_SW1))
-        heading = (heading + 3) % 4; 
-    if (hal_button_pressed(HACKPAD_BTN_SW4))
-        heading = (heading + 1) % 4; 
 
     /* Logica de restart și ieșire când e Game Over */
     if (!running) {
@@ -150,6 +141,16 @@ static void game_tick(lv_timer_t *t)
         }
         return;
     }
+
+    /* Mapare direcții absolute cu prevenirea întoarcerilor la 180 grade */
+    if (hal_button_pressed(HACKPAD_BTN_SW3) && heading != DOWN)
+        heading = UP;
+    else if (hal_button_pressed(HACKPAD_BTN_SW1) && heading != UP)
+        heading = DOWN;
+    else if (hal_button_pressed(HACKPAD_BTN_SW2) && heading != LEFT)
+        heading = RIGHT;
+    else if (hal_button_pressed(HACKPAD_BTN_SW4) && heading != RIGHT)
+        heading = LEFT;
 
     struct cell head = {
         body[0].x + dx[heading],
