@@ -514,6 +514,13 @@
 	status = "okay";
 };
 
+&lpi2c7 {
+    clock-frequency = <400000>;       /* Fast mode: 400 kHz */
+    pinctrl-names = "default";
+    pinctrl-0 = <&pinctrl_lpi2c7>;
+    status = "okay";
+};
+
 &usdhc2 {
 	bus-width = <4>;
 	cd-gpios = <&gpio3 00 GPIO_ACTIVE_LOW>;
@@ -550,6 +557,13 @@
 };
 
 &iomuxc {
+
+	pinctrl_lpi2c7: lpi2c7grp {
+        fsl,pins = <
+            MX93_PAD_GPIO_IO08__LPI2C7_SDA   0x40000b9e
+            MX93_PAD_GPIO_IO09__LPI2C7_SCL   0x40000b9e
+        >;
+    };
 
 	pinctrl_eqos: eqosgrp {
 		fsl,pins = <
