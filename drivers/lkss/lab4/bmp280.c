@@ -19,6 +19,10 @@
 #include <linux/delay.h>
 #include <linux/sysfs.h>
 #include <linux/kernel.h>
+#include <linux/mutex.h>
+#include <linux/timer.h>
+#include <linux/workqueue.h>
+#include <linux/jiffies.h>
 #include <linux/unaligned.h>
 
 /* ------------------------------------------------------------------ */
@@ -41,10 +45,7 @@
 
 #define BMP280_STATUS_MEASURING   BIT(3)
 
-/* TODO 7  (given - study it)
- * Per-chip factory calibration coefficients.
- * Mind the signedness: dig_T1 and dig_P1 are UNSIGNED, the rest are SIGNED.
- */
+/* ===== TODO 7 (given) ===== per-chip factory calibration coefficients */
 struct bmp280_calib {
 	u16 dig_T1;
 	s16 dig_T2;
@@ -60,68 +61,46 @@ struct bmp280_calib {
 	s16 dig_P9;
 };
 
-/* TODO 11  driver private data
- * Add the timer_list and work_struct fields needed by Exercise 8.
- */
+/* ===== TODO 11 + TODO 15 ===== driver private data */
 struct bmp280_data {
 	struct i2c_client    *client;
 	struct bmp280_calib   calib;
 	s32                   t_fine;
-	/* TODO 15 (Exercise 8 bonus) */
-	struct timer_list poll_timer;
-	struct work_struct poll_work;
+	struct mutex          lock;        /* serialises trigger+read on the bus */
+	struct timer_list     poll_timer;  /* Exercise 8 */
+	struct work_struct    poll_work;   /* Exercise 8 */
 };
 
 /* ================================================================== */
 /* Low-level sensor helpers                                           */
 /* ================================================================== */
 
-/* TODO 5  Exercise 5
- * Kick off a single forced-mode measurement.
- * Write BMP280_CTRL_MEAS_FORCED to BMP280_REG_CTRL_MEAS.
- * Return 0 on success or the negative errno from the i2c call.
- */
+/* ===== TODO 5 ===== kick off one forced-mode measurement */
 static int bmp280_trigger_measurement(struct i2c_client *client)
 {
-	/*
-	 * ctrl_meas (0xF4):
-	 *   osrs_t [7:5] = 001  -> temperature oversampling x1
-	 *   osrs_p [4:2] = 001  -> pressure    oversampling x1
-	 *   mode   [1:0] = 01   -> forced mode (one shot, then back to sleep)
-	 * 001 001 01 = 0x27
-	 */
-	return i2c_smbus_write_byte_data(client, BMP280_REG_CTRL_MEAS, 0x27);
+	return i2c_smbus_write_byte_data(client, BMP280_REG_CTRL_MEAS,
+					 BMP280_CTRL_MEAS_FORCED);
 }
 
-/* TODO 6  Exercise 5
- * Burst-read the 6 raw bytes at 0xF7 and unpack the two 20-bit ADC values.
- * Layout: buf[0..2] = pressure MSB/LSB/XLSB, buf[3..5] = temperature.
- * Remember the >> 4 on the XLSB byte. Check the return value (< 0 == error).
- */
+/* ===== TODO 6 ===== burst-read the 6 raw bytes and unpack two 20-bit values */
 static int bmp280_read_raw(struct i2c_client *client, s32 *adc_t, s32 *adc_p)
 {
 	u8 buf[6];
 	int ret;
 
-	/* ret = i2c_smbus_read_i2c_block_data(client, ......, 6, buf); */
-	/* if (ret < 0) return ret; */
-	/* *adc_p = ((s32)buf[0] << 12) | ((s32)buf[1] << 4) | (buf[2] >> 4); */
-	/* *adc_t = ((s32)buf[3] << 12) | ((s32)buf[4] << 4) | (buf[5] >> 4); */
-	(void)buf; (void)ret;
-	ret = i2c_smbus_read_i2c_block_data(client, BMP280_REG_PRESS_MSB, 6, buf);
+	ret = i2c_smbus_read_i2c_block_data(client, BMP280_REG_PRESS_MSB,
+					    sizeof(buf), buf);
 	if (ret < 0)
-    	return ret;
+		return ret;
+	if (ret != sizeof(buf))
+		return -EIO;
+
 	*adc_p = ((s32)buf[0] << 12) | ((s32)buf[1] << 4) | (buf[2] >> 4);
 	*adc_t = ((s32)buf[3] << 12) | ((s32)buf[4] << 4) | (buf[5] >> 4);
-	
-	return ret;
+	return 0;
 }
 
-/* TODO 8  Exercise 6
- * Read 24 calibration bytes from 0x88 and decode the little-endian s16/u16
- * fields into *calib (use get_unaligned_le16(buf + offset), cast to s16 for
- * the signed fields). Offsets: T1@0 T2@2 T3@4 P1@6 P2@8 ... P9@22.
- */
+/* ===== TODO 8 ===== read + decode the 24 little-endian calibration bytes */
 static int bmp280_read_calib(struct i2c_client *client,
 			     struct bmp280_calib *calib)
 {
@@ -129,13 +108,16 @@ static int bmp280_read_calib(struct i2c_client *client,
 	int ret;
 
 	ret = i2c_smbus_read_i2c_block_data(client, BMP280_REG_CALIB00,
-	                                    BMP280_CALIB_LEN, buf);
-	if (ret < 0) return ret;
-	
-	calib->dig_T1 = get_unaligned_le16(buf + 0);
+					    BMP280_CALIB_LEN, buf);
+	if (ret < 0)
+		return ret;
+	if (ret != BMP280_CALIB_LEN)
+		return -EIO;
+
+	calib->dig_T1 =      get_unaligned_le16(buf + 0);
 	calib->dig_T2 = (s16)get_unaligned_le16(buf + 2);
 	calib->dig_T3 = (s16)get_unaligned_le16(buf + 4);
-	calib->dig_P1 = (s16)get_unaligned_le16(buf + 6);
+	calib->dig_P1 =      get_unaligned_le16(buf + 6);
 	calib->dig_P2 = (s16)get_unaligned_le16(buf + 8);
 	calib->dig_P3 = (s16)get_unaligned_le16(buf + 10);
 	calib->dig_P4 = (s16)get_unaligned_le16(buf + 12);
@@ -144,125 +126,120 @@ static int bmp280_read_calib(struct i2c_client *client,
 	calib->dig_P7 = (s16)get_unaligned_le16(buf + 18);
 	calib->dig_P8 = (s16)get_unaligned_le16(buf + 20);
 	calib->dig_P9 = (s16)get_unaligned_le16(buf + 22);
-	
-	(void)buf; (void)ret;
-
-	return ret;
+	return 0;
 }
 
-/* TODO 9  Exercise 6
- * Temperature compensation (datasheet 3.11.3). All locals s32.
- * Returns temperature in 0.01 degC; writes t_fine through the pointer.
- */
+/* ===== TODO 9 ===== temperature compensation (datasheet 3.11.3), s32 maths */
 static s32 bmp280_compensate_temp(struct bmp280_calib *c, s32 adc_T,
 				  s32 *t_fine)
 {
-    s32 var1, var2;
+	s32 var1, var2;
 
-    var1 = ((((adc_T >> 3) - ((s32)c->dig_T1 << 1))) * ((s32)c->dig_T2)) >> 11;
-    var2 = (((((adc_T >> 4) - (s32)c->dig_T1) *
-              ((adc_T >> 4) - (s32)c->dig_T1)) >> 12) * (s32)c->dig_T3) >> 14;
-    *t_fine = var1 + var2;
-    return (*t_fine * 5 + 128) >> 8;   /* 0.01 degC units */
+	var1 = ((((adc_T >> 3) - ((s32)c->dig_T1 << 1))) * ((s32)c->dig_T2)) >> 11;
+	var2 = (((((adc_T >> 4) - (s32)c->dig_T1) *
+		  ((adc_T >> 4) - (s32)c->dig_T1)) >> 12) * (s32)c->dig_T3) >> 14;
+	*t_fine = var1 + var2;
+	return (*t_fine * 5 + 128) >> 8;   /* 0.01 degC */
 }
 
-/* TODO 10  Exercise 6
- * Pressure compensation (datasheet 3.11.3). All locals s64.
- * Returns pressure in Q24.8 Pa (result / 256 == Pa).
- * See the lab Theory section for the complete formula.
- */
+/* ===== TODO 10 ===== pressure compensation (datasheet 3.11.3), s64 maths.
+ * Returns Q24.8 Pa: result / 256 == Pa. */
 static u32 bmp280_compensate_press(struct bmp280_calib *c, s32 adc_P,
 				   s32 t_fine)
 {
-    s64 var1, var2, p;
+	s64 var1, var2, p;
 
-    var1 = ((s64)t_fine) - 128000;
-    var2 = var1 * var1 * (s64)c->dig_P6;
-    var2 = var2 + ((var1 * (s64)c->dig_P5) << 17);
-    var2 = var2 + (((s64)c->dig_P4) << 35);
-    var1 = ((var1 * var1 * (s64)c->dig_P3) >> 8) +
-           ((var1 * (s64)c->dig_P2) << 12);
-    var1 = (((((s64)1) << 47) + var1)) * ((s64)c->dig_P1) >> 33;
+	var1 = ((s64)t_fine) - 128000;
+	var2 = var1 * var1 * (s64)c->dig_P6;
+	var2 = var2 + ((var1 * (s64)c->dig_P5) << 17);
+	var2 = var2 + (((s64)c->dig_P4) << 35);
+	var1 = ((var1 * var1 * (s64)c->dig_P3) >> 8) +
+	       ((var1 * (s64)c->dig_P2) << 12);
+	var1 = (((((s64)1) << 47) + var1)) * ((s64)c->dig_P1) >> 33;
 
-    if (var1 == 0)
-        return 0;       /* avoid divide-by-zero */
+	if (var1 == 0)
+		return 0;       /* avoid divide-by-zero */
 
-    p = 1048576 - adc_P;
-    p = (((p << 31) - var2) * 3125) / var1;
-    var1 = (((s64)c->dig_P9) * (p >> 13) * (p >> 13)) >> 25;
-    var2 = (((s64)c->dig_P8) * p) >> 19;
-    p = ((p + var1 + var2) >> 8) + (((s64)c->dig_P7) << 4);
+	p = 1048576 - adc_P;
+	p = (((p << 31) - var2) * 3125) / var1;
+	var1 = (((s64)c->dig_P9) * (p >> 13) * (p >> 13)) >> 25;
+	var2 = (((s64)c->dig_P8) * p) >> 19;
+	p = ((p + var1 + var2) >> 8) + (((s64)c->dig_P7) << 4);
 
-    return (u32)p;       /* Q24.8 Pa */
+	return (u32)p;       /* Q24.8 Pa */
 }
 
-/* Convenience: trigger -> wait -> read -> compensate. Used by sysfs + bonus. */
+/*
+ * Convenience: trigger -> wait -> read -> compensate, under the bus mutex so
+ * concurrent sysfs reads and the periodic worker never interleave on the wire
+ * or clobber t_fine. (Exercise 7, question 2.)
+ */
 static int bmp280_measure(struct bmp280_data *data, s32 *temp_cC, u32 *press_q24)
 {
 	s32 adc_t, adc_p;
 	int ret;
 
+	mutex_lock(&data->lock);
+
 	ret = bmp280_trigger_measurement(data->client);
 	if (ret < 0)
-		return ret;
+		goto out;
 
 	msleep(10); /* worst-case conversion time at osrs x1 */
 
 	ret = bmp280_read_raw(data->client, &adc_t, &adc_p);
 	if (ret < 0)
-		return ret;
+		goto out;
 
 	*temp_cC   = bmp280_compensate_temp(&data->calib, adc_t, &data->t_fine);
 	*press_q24 = bmp280_compensate_press(&data->calib, adc_p, data->t_fine);
-	return 0;
+	ret = 0;
+out:
+	mutex_unlock(&data->lock);
+	return ret;
 }
 
 /* ================================================================== */
 /* sysfs attributes (Exercise 7)                                      */
 /* ================================================================== */
 
-/* TODO 13  Exercise 7
- * temperature_show: recover bmp280_data, take a measurement, emit "%d.%02d\n".
- */
+/* ===== TODO 13 ===== temperature_show */
 static ssize_t temperature_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
-	/* recover your data with dev_get_drvdata(dev) */
 	struct bmp280_data *data = dev_get_drvdata(dev);
-	s32 temp; u32 praw;
+	s32 temp;
+	u32 praw;
 	int ret;
 
-	/* take a measurement, call bmp280_measure() */
 	ret = bmp280_measure(data, &temp, &praw);
 	if (ret < 0)
 		return ret;
 
+	/* temp is in 0.01 degC. Note: this simple split drops the minus sign
+	 * for values in (-1.00, 0.00) degC; fine for this lab's climate. */
 	return sysfs_emit(buf, "%d.%02d\n", temp / 100, abs(temp % 100));
 }
 
-/* TODO 13  Exercise 7
- * pressure_show: same idea, convert Q24.8 -> hPa (/ 25600) and emit it.
- */
+/* ===== TODO 13 ===== pressure_show */
 static ssize_t pressure_show(struct device *dev,
 			     struct device_attribute *attr, char *buf)
 {
-	/* recover your data with dev_get_drvdata(dev) */
 	struct bmp280_data *data = dev_get_drvdata(dev);
-	s32 temp; u32 praw;
+	s32 temp;
+	u32 praw, pa;
 	int ret;
 
-	/* take a measurement, call bmp280_measure() */
 	ret = bmp280_measure(data, &temp, &praw);
 	if (ret < 0)
 		return ret;
 
-	s32 phpa = praw / 256;
-	return sysfs_emit(buf, "%d.%02d\n", phpa / 100, phpa % 100); 
+	pa = praw / 256;                 /* Q24.8 -> Pa */
+	/* pa / 100 = hPa integer part, pa % 100 = hundredths of hPa */
+	return sysfs_emit(buf, "%u.%02u\n", pa / 100, pa % 100);
 }
 
-/* TODO 12  Exercise 7
- * Declare the two read-only attributes and bundle them into a group.
- */
+/* ===== TODO 12 ===== declare the read-only attributes and group them */
 static DEVICE_ATTR_RO(temperature);
 static DEVICE_ATTR_RO(pressure);
 
@@ -271,19 +248,39 @@ static struct attribute *bmp280_attrs[] = {
 	&dev_attr_pressure.attr,
 	NULL,
 };
-ATTRIBUTE_GROUPS(bmp280);
+ATTRIBUTE_GROUPS(bmp280);   /* generates bmp280_groups[] */
 
 /* ================================================================== */
 /* Exercise 8 bonus: periodic sampling                                */
 /* ================================================================== */
 
-/* TODO 18  work handler: runs in process context, may sleep / do I2C */
-static void bmp280_poll_work(struct work_struct *w){
+/* ===== TODO 18 ===== work handler - PROCESS context, may sleep / do I2C */
+static void bmp280_poll_work(struct work_struct *w)
+{
+	struct bmp280_data *data = container_of(w, struct bmp280_data, poll_work);
+	s32 temp;
+	u32 praw, pa;
 
+	if (bmp280_measure(data, &temp, &praw) < 0)
+		return;
+
+	pa = praw / 256;
+	dev_info(&data->client->dev,
+		 "poll: temperature = %d.%02d degC, pressure = %u.%02u hPa\n",
+		 temp / 100, abs(temp % 100), pa / 100, pa % 100);
 }
-/* TODO 17  timer callback: atomic context, must NOT do I2C            */
-static void bmp280_poll_timer(struct timer_list *t){
 
+/* ===== TODO 17 ===== timer callback - ATOMIC context, must NOT do I2C */
+static void bmp280_poll_timer(struct timer_list *t)
+{
+	/* from_timer() recovers the containing struct; on kernels >= 6.16 the
+	 * same macro is spelled timer_container_of(). */
+	struct bmp280_data *data = timer_container_of(data, t, poll_timer);
+
+	/* I2C sleeps, so we cannot read here. Bounce to the workqueue ... */
+	schedule_work(&data->poll_work);
+	/* ... and re-arm for the next second. */
+	mod_timer(&data->poll_timer, jiffies + HZ);
 }
 
 /* ================================================================== */
@@ -295,14 +292,11 @@ static int bmp280_probe(struct i2c_client *client)
 	struct bmp280_data *data;
 	int ret, id;
 
-	/* TODO 2  Exercise 3: announce binding */
-	/* dev_info(&client->dev, "BMP280 driver bound at address 0x%02x\n",
-	 *          client->addr); */
-
+	/* ===== TODO 2 ===== announce binding */
 	dev_info(&client->dev, "BMP280 driver bound at address 0x%02x\n",
-         client->addr);
+		 client->addr);
 
-	/* TODO 4  Exercise 4: read & verify chip ID  - use "i2c_smbus_read_byte_data(const struct i2c_client *client, u8 command)" */
+	/* ===== TODO 4 ===== read & verify chip ID */
 	id = i2c_smbus_read_byte_data(client, BMP280_REG_ID);
 	if (id < 0) {
 		dev_err(&client->dev, "failed to read chip ID: %d\n", id);
@@ -313,76 +307,59 @@ static int bmp280_probe(struct i2c_client *client)
 	if (id != BMP280_CHIP_ID)
 		return -ENODEV;
 
-	/* TODO Exercise 5: Call bmp280_trigger_measurement + bmp280_read_raw, print the raw values */
-	bmp280_trigger_measurement(client);
-
-	s32 adc_t, adc_p;
-	bmp280_read_raw(client, &adc_t, &adc_p);
-
-	dev_info(&client->dev, "raw adc_t=%d adc_p=%d\n", adc_t, adc_p);
-
-	/* TODO 11  Exercise 7: allocate + store private data */
+	/* ===== TODO 11 ===== allocate + store private data */
 	data = devm_kzalloc(&client->dev, sizeof(*data), GFP_KERNEL);
 	if (!data)
 		return -ENOMEM;
 	data->client = client;
+	mutex_init(&data->lock);
 	i2c_set_clientdata(client, data);
 
-	/* TODO 8 (call)  Exercise 6: cache calibration once */
+	/* ===== TODO 8 (call) ===== cache calibration once */
 	ret = bmp280_read_calib(client, &data->calib);
 	if (ret < 0) {
 		dev_err(&client->dev, "failed to read calibration: %d\n", ret);
 		return ret;
 	}
 
-	s32 temp = bmp280_compensate_temp(&data->calib, adc_t, &data->t_fine);  /* 0.01 degC */
-	u32 praw = bmp280_compensate_press(&data->calib, adc_p, data->t_fine);  /* Q24.8 Pa  */
-	u32 phpa = praw / 256;                /* Pa  */
-	dev_info(&client->dev,
-         "temperature = %d.%02d degC, pressure = %u.%02u hPa\n",
-         temp / 100, abs(temp % 100),
-         phpa / 100, phpa % 100);
+	/* sysfs attributes are created automatically from .dev_groups (TODO 14).
+	 * Manual alternative:
+	 *   ret = sysfs_create_group(&client->dev.kobj, &bmp280_group);
+	 */
 
-	/* The attribute group is created automatically via .dev_groups below
-	 * (see TODO 14 note). If you prefer the manual route, call 
-	sysfs_create_group(&client->dev.kobj, &bmp280_group); */
-
-	/* TODO 16  Exercise 8: timer_setup() + INIT_WORK() + mod_timer() */
-	timer_setup(data->poll_timer, bmp280_poll_work, 0);
-
-	mod_timer(&data->poll_timer, jiffies + HZ)
-
-	INIT_WORK(bmp280_poll_work, )
-
+	/* ===== TODO 16 ===== set up the periodic poll (Exercise 8) */
+	INIT_WORK(&data->poll_work, bmp280_poll_work);
+	timer_setup(&data->poll_timer, bmp280_poll_timer, 0);
+	mod_timer(&data->poll_timer, jiffies + HZ);
 
 	return 0;
 }
 
 static void bmp280_remove(struct i2c_client *client)
 {
-	/* TODO 19  Exercise 8: timer_delete_sync() THEN cancel_work_sync()
+	struct bmp280_data *data = i2c_get_clientdata(client);
+
+	/* ===== TODO 19 ===== cancel producer (timer) BEFORE consumer (work).
 	 * timer_delete_sync() guarantees the callback isn't mid-flight and
 	 * won't re-arm; only then is it safe to drain the queued work. */
-	
-	/* struct bmp280_data *data = i2c_get_clientdata(client); */ /* uncomment me on Exercise 8 */
-	/* TODO 3  Exercise 3: say goodbye */
-	dev_info(&client->dev, "BMP280 driver removed\n");
 
+	timer_delete_sync(&data->poll_timer);
+	cancel_work_sync(&data->poll_work);
+
+	/* ===== TODO 3 ===== say goodbye */
+	dev_info(&client->dev, "BMP280 driver removed\n");
 }
 
-/* TODO 1  Exercise 3: match tables
- * Fill in the OF compatible "lkss,bmp280" and the i2c_device_id "bmp280".
- * Keep the trailing { } sentinel on both tables.
- */
+/* ===== TODO 1 ===== match tables */
 static const struct of_device_id bmp280_of_match[] = {
 	{ .compatible = "lkss,bmp280" },
-	{/* sentinel */ }
+	{ }
 };
 MODULE_DEVICE_TABLE(of, bmp280_of_match);
 
 static const struct i2c_device_id bmp280_id[] = {
 	{ "bmp280", 0 },
-	{/* sentinel */ }
+	{ }
 };
 MODULE_DEVICE_TABLE(i2c, bmp280_id);
 
@@ -390,9 +367,7 @@ static struct i2c_driver bmp280_driver = {
 	.driver = {
 		.name		= "lkss_bmp280",
 		.of_match_table	= bmp280_of_match,
-		/* TODO 14  Exercise 7: expose attributes the easy way */
-		.dev_groups = bmp280_groups,
-		
+		.dev_groups	= bmp280_groups,   /* ===== TODO 14 ===== */
 	},
 	.probe		= bmp280_probe,
 	.remove		= bmp280_remove,
@@ -403,6 +378,3 @@ module_i2c_driver(bmp280_driver);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("NXP Linux Kernel Summer School");
 MODULE_DESCRIPTION("Lab4: BMP280 I2C pressure/temperature sensor driver");
-
-//Valentin Porumbel
-//Andrei Cherechesu
