@@ -223,6 +223,7 @@ int main(void)
 
     score_lbl = lv_label_create(scr);
     if (score_lbl) {
+	lv_obj_set_style_text_font(score_lbl, &lv_font_montserrat_18, 0);
         lv_obj_set_style_text_color(score_lbl, lv_color_hex(0x808080), 0);
         lv_obj_align(score_lbl, LV_ALIGN_TOP_RIGHT, -4, 2);
     }
